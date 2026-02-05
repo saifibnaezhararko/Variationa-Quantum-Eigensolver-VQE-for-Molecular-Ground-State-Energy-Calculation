@@ -54,17 +54,23 @@ def hardware_efficient_ansatz(params, wires):
             qml.RY(params[layer][i], wires=i)
             qml.RZ(params[layer][i + n_qubits], wires=i)
 
+        # Full entanglement: circular CNOT chain
         for i in range(n_qubits - 1):
             qml.CNOT(wires=[i, i + 1])
+        if n_qubits > 2:
+            qml.CNOT(wires=[n_qubits - 1, 0])
 
 @qml.qnode(dev)
 def vqe_circuit(params, hamiltonian):
+    # Hartree-Fock state for H2: |1100>
     qml.PauliX(wires=0)
+    qml.PauliX(wires=1)
     hardware_efficient_ansatz(params, qubits)
     return qml.expval(hamiltonian)
 
-n_layers = 2
+n_layers = 4
 params_shape = (n_layers, 2 * qubits)
+np.random.seed(42)
 init_params = np.random.random(params_shape) * 0.1
 
 print("VQE Circuit Structure:")
@@ -89,9 +95,10 @@ print(f"Initial energy: {cost_function(init_params_flat):.8f} Hartree\n")
 result = minimize(
     cost_function,
     init_params_flat,
-    method='COBYLA',
+    method='L-BFGS-B',
+    jac='3-point',
     callback=callback,
-    options={'maxiter': 100}
+    options={'maxiter': 300, 'ftol': 1e-12}
 )
 
 vqe_energy = result.fun
@@ -151,26 +158,41 @@ plt.show()
 
 print("\nConvergence plot saved!")
 
-bond_lengths = np.linspace(0.5, 3.0, 10)
+bond_lengths = np.linspace(0.5, 4.5, 15)
 vqe_energies = []
 hf_energies = []
 
 print("Scanning potential energy surface...\n")
 
-optimal_params = result.x.reshape(params_shape)
+# Use warm-starting: previous bond length's optimal params as initial guess for next
+current_params = result.x.copy()
 
 for bond_length in bond_lengths:
     coords = np.array([0.0, 0.0, 0.0, 0.0, 0.0, bond_length])
 
     H, _ = qml.qchem.molecular_hamiltonian(symbols, coords, basis='sto-3g')
-    energy_vqe = vqe_circuit(optimal_params, H)
+
+    # Re-optimize VQE for each bond length (warm-started from previous)
+    def cost_fn_scan(params_flat):
+        params = params_flat.reshape(params_shape)
+        return vqe_circuit(params, H)
+
+    res_scan = minimize(
+        cost_fn_scan,
+        current_params,
+        method='L-BFGS-B',
+        jac='3-point',
+        options={'maxiter': 200, 'ftol': 1e-12}
+    )
+    energy_vqe = res_scan.fun
+    current_params = res_scan.x.copy()  # warm-start next iteration
     vqe_energies.append(energy_vqe)
 
     mol_scan = qml.qchem.Molecule(symbols, np_regular.array(coords.reshape(-1, 3)), basis_name='sto-3g')
     energy_hf = qml.qchem.scf(mol_scan)()[0][0]
     hf_energies.append(energy_hf)
 
-    print(f"Bond length: {bond_length:.2f} Bohr | VQE: {energy_vqe:.6f} Ha | HF: {energy_hf:.6f} Ha")
+    print(f"Bond length: {bond_length:.2f} Bohr ({bond_length*0.529:.2f} Å) | VQE: {energy_vqe:.6f} Ha | HF: {energy_hf:.6f} Ha")
 
 plt.figure(figsize=(10, 6))
 plt.plot(bond_lengths * 0.529, vqe_energies, 'bo-', linewidth=2, markersize=8, label='VQE')
